@@ -44,58 +44,88 @@ clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos
 # cutlass
-FetchContent_Declare(
-    repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-cutlass)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-cutlass")
+    set(repo-cutlass_SOURCE_DIR "${DEPS_DIR}/repo-cutlass" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-cutlass -> ${DEPS_DIR}/repo-cutlass")
+else()
+    FetchContent_Declare(
+        repo-cutlass
+        GIT_REPOSITORY https://github.com/NVIDIA/cutlass
+        GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-cutlass)
+endif()
 
 # fmt
-FetchContent_Declare(
-    repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-fmt)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-fmt")
+    set(repo-fmt_SOURCE_DIR "${DEPS_DIR}/repo-fmt" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-fmt -> ${DEPS_DIR}/repo-fmt")
+else()
+    FetchContent_Declare(
+        repo-fmt
+        GIT_REPOSITORY https://github.com/fmtlib/fmt
+        GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-fmt)
+endif()
 
 # Triton kernel
-FetchContent_Declare(
-    repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.6.0
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-triton)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-triton")
+    set(repo-triton_SOURCE_DIR "${DEPS_DIR}/repo-triton" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-triton -> ${DEPS_DIR}/repo-triton")
+else()
+    FetchContent_Declare(
+        repo-triton
+        GIT_REPOSITORY "https://github.com/triton-lang/triton"
+        GIT_TAG        v3.6.0
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-triton)
+endif()
 
 # flashinfer
-FetchContent_Declare(
-    repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flashinfer)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-flashinfer")
+    set(repo-flashinfer_SOURCE_DIR "${DEPS_DIR}/repo-flashinfer" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-flashinfer -> ${DEPS_DIR}/repo-flashinfer")
+else()
+    FetchContent_Declare(
+        repo-flashinfer
+        GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
+        GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-flashinfer)
+endif()
 
 # flash-attention
-FetchContent_Declare(
-    repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flash-attention)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-flash-attention")
+    set(repo-flash-attention_SOURCE_DIR "${DEPS_DIR}/repo-flash-attention" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-flash-attention -> ${DEPS_DIR}/repo-flash-attention")
+else()
+    FetchContent_Declare(
+        repo-flash-attention
+        GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
+        GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-flash-attention)
+endif()
 
 # mscclpp
-FetchContent_Declare(
-    repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-mscclpp)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-mscclpp")
+    set(repo-mscclpp_SOURCE_DIR "${DEPS_DIR}/repo-mscclpp" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-mscclpp -> ${DEPS_DIR}/repo-mscclpp")
+else()
+    FetchContent_Declare(
+        repo-mscclpp
+        GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
+        GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-mscclpp)
+endif()
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -207,7 +237,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -326,7 +356,19 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+    ${TORCH_INCLUDE_DIRS}
 )
+
+# Pre-populate nanobind and dlpack to avoid FetchContent downloads by scikit-build-core
+# Must use FetchContent_Declare (not set CACHE vars) so downstream FetchContent_MakeAvailable skips download
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-nanobind")
+    FetchContent_Declare(nanobind SOURCE_DIR "${DEPS_DIR}/repo-nanobind")
+    message(STATUS "Using pre-downloaded dep: repo-nanobind -> ${DEPS_DIR}/repo-nanobind")
+endif()
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-dlpack")
+    FetchContent_Declare(dlpack SOURCE_DIR "${DEPS_DIR}/repo-dlpack")
+    message(STATUS "Using pre-downloaded dep: repo-dlpack -> ${DEPS_DIR}/repo-dlpack")
+endif()
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
@@ -342,20 +384,7 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
-# =========================== Common SM100+ Build ============================= #
-# Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-
-target_compile_options(common_ops_sm100_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-)
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
-)
-
+# CXX11 ABI detection (needed by both sm90 and sm100 builds)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
@@ -373,6 +402,12 @@ else()
 endif()
 
 # mscclpp option
+# Declare json with SOURCE_DIR so FetchContent skips download
+# Must come BEFORE add_subdirectory(mscclpp) which declares its own FetchContent(json)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-json")
+    FetchContent_Declare(json SOURCE_DIR "${DEPS_DIR}/repo-json")
+    message(STATUS "Using pre-downloaded dep: repo-json -> ${DEPS_DIR}/repo-json")
+endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
@@ -381,26 +416,38 @@ add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
 
+# sm90 link, compile definitions, and install (unconditional)
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-
-# sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
+install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+
+# =========================== Common SM100+ Build ============================= #
+# Build SM100+ library with precise math (same namespace, different directory)
+if (SGL_KERNEL_ENABLE_SM100A)
+Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+
+target_compile_options(common_ops_sm100_build PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+)
+target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
+# Set output name and separate build directory to avoid conflicts
+set_target_properties(common_ops_sm100_build PROPERTIES
+    OUTPUT_NAME "common_ops"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+)
+
+target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_compile_definitions(common_ops_sm100_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
-
-# Install to different subdirectories
-# CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
-# and install them to the specified destinations
-install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+endif()
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file

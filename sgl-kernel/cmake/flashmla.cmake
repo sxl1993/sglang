@@ -1,11 +1,16 @@
 # flash_mla
-FetchContent_Declare(
-    repo-flashmla
-    GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG df022ebafb88578eab9f0300606ee765608d8b5c
-    GIT_SHALLOW OFF
-)
-FetchContent_Populate(repo-flashmla)
+if(DEPS_DIR AND EXISTS "${DEPS_DIR}/repo-flashmla")
+    set(repo-flashmla_SOURCE_DIR "${DEPS_DIR}/repo-flashmla" CACHE PATH "")
+    message(STATUS "Using pre-downloaded dep: repo-flashmla -> ${DEPS_DIR}/repo-flashmla")
+else()
+    FetchContent_Declare(
+        repo-flashmla
+        GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
+        GIT_TAG df022ebafb88578eab9f0300606ee765608d8b5c
+        GIT_SHALLOW OFF
+    )
+    FetchContent_Populate(repo-flashmla)
+endif()
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"
