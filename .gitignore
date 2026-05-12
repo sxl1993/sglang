@@ -278,3 +278,7 @@ sgl-kernel/csrc/**/*_musa/
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Build artifacts
+sgl-kernel/.cuda_arch
+sgl-kernel/.deps/
