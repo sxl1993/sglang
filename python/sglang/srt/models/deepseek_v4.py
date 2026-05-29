@@ -437,6 +437,9 @@ class MQALayer(nn.Module):
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
         )
 
+        self.fused_norm_rope_q = envs.SGLANG_FUSED_NORM_ROPE_Q.get()
+        self.fused_norm_rope_kv = envs.SGLANG_FUSED_NORM_ROPE_KV.get()
+
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
@@ -460,11 +463,22 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if q_out is None:
-            q_out = torch.empty_like(q)
-        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        if self.fused_norm_rope_q:
+            if q_out is None:
+                q_out = torch.empty_like(q)
+            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+            return q_out
+        else:
+            q = rms_normalize_triton(q, self.eps)
+            fused_rope_inplace(
+                q[..., -self.qk_rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+            if q_out is not None:
+                q_out.copy_(q)
+            return q_out if q_out is not None else q
 
     def _compute_kv_to_cache(
         self,
@@ -472,28 +486,41 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_a: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
+    ) -> Optional[torch.Tensor]:
+        """Compute KV norm + RoPE and write to cache.
 
-        Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
-        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        When fused_norm_rope_kv=True, uses a single fused kernel that does
+        rmsnorm + RoPE + write directly to FlashMLA paged cache.
+        When fused_norm_rope_kv=False, uses separate steps: kv_norm → RoPE →
+        return kv for the caller to store via attn_backend.store_cache().
         """
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        token_to_kv_pool = get_token_to_kv_pool()
-        if TYPE_CHECKING:
-            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
-            layer_id=self.layer_id,
-            raw_loc=forward_batch.out_cache_loc,
-            kv=kv,
-            kv_weight=self.kv_norm.weight.data,
-            eps=self.eps,
-            freqs_cis=self.freqs_cis,
-            positions=positions,
-        )
+        if self.fused_norm_rope_kv:
+            token_to_kv_pool = get_token_to_kv_pool()
+            if TYPE_CHECKING:
+                assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_id,
+                raw_loc=forward_batch.out_cache_loc,
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+            )
+            return None
+        else:
+            kv = self.kv_norm(kv)
+            fused_rope_inplace(
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+            return kv
 
     def _compute_kv_bf16(
         self,
@@ -507,13 +534,22 @@ class MQALayer(nn.Module):
         else:
             kv, _ = self.wkv(x)
         kv = kv.contiguous()
-        fused_norm_rope_inplace(
-            kv,
-            self.kv_norm.weight.data,
-            self.eps,
-            self.freqs_cis,
-            positions,
-        )
+        if self.fused_norm_rope_kv:
+            fused_norm_rope_inplace(
+                kv,
+                self.kv_norm.weight.data,
+                self.eps,
+                self.freqs_cis,
+                positions,
+            )
+        else:
+            kv = self.kv_norm(kv)
+            fused_rope_inplace(
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
         return kv
 
     def _forward_prepare_multi_stream(
@@ -561,8 +597,13 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            kv = self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            if kv is not None:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         del qkv_a
 
@@ -672,7 +713,13 @@ class MQALayer(nn.Module):
         else:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
-            self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            kv = self._compute_kv_to_cache(x_linear, positions, forward_batch, qkv_a=qkv_a)
+            if kv is not None:
+                attn_backend.store_cache(
+                    layer_id=self.layer_id,
+                    swa_k=kv,
+                    forward_batch=forward_batch,
+                )
 
         del qkv_a
 
@@ -789,10 +836,16 @@ class MQALayer(nn.Module):
                     forward_batch=forward_batch,
                 )
             else:
-                self._compute_kv_to_cache(
+                kv = self._compute_kv_to_cache(
                     x_linear, positions, forward_batch, qkv_a=qkv_a
                 )
-                kv = None
+                if kv is not None:
+                    attn_backend.store_cache(
+                        layer_id=self.layer_id,
+                        swa_k=kv,
+                        forward_batch=forward_batch,
+                    )
+                    kv = None
 
         del qkv_a
 
