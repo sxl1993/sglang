@@ -7,7 +7,7 @@
 # 用法：bash scripts/build_sglang.sh <cuda_version>
 #   bash scripts/build_sglang.sh 12.8
 #   bash scripts/build_sglang.sh 12.9
-#   BUILD_WHL=1 CLEAN_BUILD=1 bash scripts/build_sglang.sh 12.8
+#   BUILD_WHL=1 CLEAN_BUILD=1 bash scripts/build_sglang.sh 12.9
 #
 # 环境变量:
 #   MAX_JOBS              - 并行编译数 (默认: 24)
@@ -26,10 +26,10 @@ CUDA_VER_SHORT="${CUDA_VER//./}"  # 12.8 → 128
 # 按 CUDA 版本配置
 case "$CUDA_VER" in
     12.8)
-        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu128/ --extra-index-url https://pypi.org/simple/ torch==2.11.0+cu128 torchaudio==2.11.0+cu128 torchvision==0.26.0+cu128"
+        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu128 torch==2.11.0+cu128 torchaudio==2.11.0+cu128 torchvision==0.26.0+cu128"
         ;;
     12.9)
-        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu129/ --extra-index-url https://pypi.org/simple/ torch==2.11.0+cu129 torchaudio==2.11.0+cu129 torchvision==0.26.0+cu129"
+        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu129  torch==2.11.0+cu129 torchaudio==2.11.0+cu129 torchvision==0.26.0+cu129"
         ;;
     *)
         echo "不支持的 CUDA 版本: $CUDA_VER (支持: 12.8, 12.9)" >&2
