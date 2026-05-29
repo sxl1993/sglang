@@ -15,12 +15,13 @@
 #   TORCH_CUDA_ARCH_LIST  - 目标 GPU 架构 (默认: 自动检测)
 #   BUILD_WHL             - 设为 1 编译 sglang whl 包并安装（默认 editable 安装）
 #   CLEAN_BUILD           - 设为 1 清理编译缓存
+#   SGL_KERNEL_ENABLE_SM100A - SM100A 支持 (默认: OFF)
 #   CCACHE_DIR            - ccache 缓存目录 (默认: ~/.cache/ccache)
 # ============================================================================
 
 set -euo pipefail
 
-CUDA_VER="${1:?用法: bash scripts/build_sglang.sh <cuda_version>  (例如 12.8, 12.9)}"
+CUDA_VER="${1:?用法: bash scripts/build_sglang.sh <cuda_version> (例如 12.8, 12.9)}"
 CUDA_VER_SHORT="${CUDA_VER//./}"  # 12.8 → 128
 
 # 按 CUDA 版本配置
@@ -29,7 +30,7 @@ case "$CUDA_VER" in
         INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu128 torch==2.11.0+cu128 torchaudio==2.11.0+cu128 torchvision==0.26.0+cu128"
         ;;
     12.9)
-        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu129  torch==2.11.0+cu129 torchaudio==2.11.0+cu129 torchvision==0.26.0+cu129"
+        INSTALL_TORCH_CMD="pip install --index-url https://mirrors.aliyun.com/pytorch-wheels/cu129 torch==2.11.0+cu129 torchaudio==2.11.0+cu129 torchvision==0.26.0+cu129"
         ;;
     *)
         echo "不支持的 CUDA 版本: $CUDA_VER (支持: 12.8, 12.9)" >&2
@@ -69,11 +70,19 @@ NVCC_VERSION=$(nvcc --version | grep -oP 'release \K[\d.]+' | head -1)
 
 TORCH_INFO=$(python3 -c "
 import torch
-print(f'{torch.version.cuda}|{torch.__version__}|{torch.cuda.is_available()}')
-" 2>/dev/null || echo "||False")
+cuda_ver = torch.version.cuda or ''
+version = torch.__version__
+avail = torch.cuda.is_available()
+arch = ''
+if avail and torch.cuda.device_count() > 0:
+    cap = torch.cuda.get_device_capability(0)
+    arch = f'{cap[0]}.{cap[1]}'
+print(f'{cuda_ver}|{version}|{avail}|{arch}')
+" 2>/dev/null || echo "||False|")
 TORCH_CUDA_VER=$(echo "$TORCH_INFO" | cut -d'|' -f1)
 TORCH_VERSION=$(echo "$TORCH_INFO" | cut -d'|' -f2)
 TORCH_CUDA_AVAIL=$(echo "$TORCH_INFO" | cut -d'|' -f3)
+GPU_ARCH_DETECTED=$(echo "$TORCH_INFO" | cut -d'|' -f4)
 
 log "CUDA Toolkit (nvcc): $NVCC_VERSION | PyTorch: $TORCH_VERSION | PyTorch CUDA runtime: ${TORCH_CUDA_VER:-未知}"
 
@@ -81,7 +90,8 @@ if [ "$TORCH_CUDA_AVAIL" != "True" ]; then
     err "PyTorch CUDA 不可用，请先安装 cu${CUDA_VER_SHORT} 版本的 PyTorch"
     exit 1
 fi
-if [ "$TORCH_CUDA_VER" != "$CUDA_VER" ]; then
+TORCH_CUDA_VER_MAJOR_MINOR=$(echo "$TORCH_CUDA_VER" | grep -oP '^\d+\.\d+')
+if [ "$TORCH_CUDA_VER_MAJOR_MINOR" != "$CUDA_VER" ]; then
     err "当前 torch.version.cuda=$TORCH_CUDA_VER, 编译需要 $CUDA_VER"
     err "sgl-kernel 编译会链接当前环境 torch 携带的 CUDA runtime，版本不匹配将导致运行时 NCCL 崩溃"
     err "请先安装："
@@ -93,9 +103,8 @@ fi
 # GPU 架构检测
 # ============================================================================
 if [ -z "${TORCH_CUDA_ARCH_LIST:-}" ]; then
-    GPU_ARCH=$(python3 -c "import torch; cap=torch.cuda.get_device_capability(0); print(f'{cap[0]}.{cap[1]}')" 2>/dev/null || echo "")
-    if [ -n "$GPU_ARCH" ]; then
-        export TORCH_CUDA_ARCH_LIST="$GPU_ARCH"
+    if [ -n "$GPU_ARCH_DETECTED" ]; then
+        export TORCH_CUDA_ARCH_LIST="$GPU_ARCH_DETECTED"
         log "GPU 架构: $TORCH_CUDA_ARCH_LIST (自动检测)"
     else
         log "GPU 架构: 未检测到，使用 CMake 默认值"
@@ -152,15 +161,13 @@ else
     log "增量编译 (设置 CLEAN_BUILD=1 可全量重编)"
 fi
 
-if [ ! -d "$DEPS_DIR/repo-cutlass/.git" ]; then
-    log "预下载 git 依赖到 .deps/..."
-    bash scripts/fetch_deps.sh 2>&1 | tee -a "$LOG_FILE"
-fi
+log "校验/下载 git 依赖..."
+bash scripts/fetch_deps.sh 2>&1 | tee -a "$LOG_FILE"
 
 MAX_JOBS="${MAX_JOBS:-24}"
 NVCC_THREADS="${NVCC_THREADS:-8}"
 
-CMAKE_ARGS="-DSGL_KERNEL_ENABLE_SM100A=OFF -DSGL_KERNEL_ENABLE_BF16=ON -DSGL_KERNEL_ENABLE_FP8=ON -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DDEPS_DIR=$DEPS_DIR"
+CMAKE_ARGS="-DSGL_KERNEL_ENABLE_SM100A=${SGL_KERNEL_ENABLE_SM100A:-OFF} -DSGL_KERNEL_ENABLE_BF16=ON -DSGL_KERNEL_ENABLE_FP8=ON -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} -DDEPS_DIR=$DEPS_DIR"
 if [ "$HAVE_CCACHE" = true ]; then
     CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 fi
@@ -173,20 +180,19 @@ log "  ccache:                $([ "$HAVE_CCACHE" = true ] && echo "已启用 ($C
 log "  .deps:                 $DEPS_DIR"
 log "预计耗时 10-20 分钟（首次编译），增量编译约 1-3 分钟"
 
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" \
-MAX_JOBS="$MAX_JOBS" \
-CMAKE_BUILD_PARALLEL_LEVEL="$MAX_JOBS" \
-CMAKE_ARGS="$CMAKE_ARGS" \
-make build 2>&1 | tee -a "$LOG_FILE"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+export MAX_JOBS="$MAX_JOBS"
+export CMAKE_BUILD_PARALLEL_LEVEL="$MAX_JOBS"
+export CMAKE_ARGS="$CMAKE_ARGS"
 
-SGL_KERNEL_WHL=$(ls dist/sglang_kernel-*.whl 2>/dev/null | head -1)
-if [ -n "$SGL_KERNEL_WHL" ]; then
-    pip install "$SGL_KERNEL_WHL" --force-reinstall 2>&1 | tee -a "$LOG_FILE"
+if ! make build 2>&1 | tee -a "$LOG_FILE"; then
+    err "sgl-kernel 编译失败，详见日志: $LOG_FILE"
+    exit 1
 fi
 
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
-python3 -c "import sgl_kernel; print('sgl-kernel OK')" 2>&1 | tee -a "$LOG_FILE"
+python3 -c "import sgl_kernel; print(f'sgl-kernel OK: {sgl_kernel.__version__}')" 2>&1 | tee -a "$LOG_FILE"
 
 # ============================================================================
 # 安装 SGLang 主包
@@ -197,7 +203,8 @@ cd "$PROJECT_ROOT"
 
 # 编译 sgl-kernel 可能拉入不兼容的 torch，再次校验
 TORCH_CUDA_VER_AFTER=$(python3 -c "import torch; print(torch.version.cuda)" 2>/dev/null || echo "")
-if [ "$TORCH_CUDA_VER_AFTER" != "$CUDA_VER" ]; then
+TORCH_CUDA_VER_AFTER_MM=$(echo "$TORCH_CUDA_VER_AFTER" | grep -oP '^\d+\.\d+')
+if [ "$TORCH_CUDA_VER_AFTER_MM" != "$CUDA_VER" ]; then
     err "torch CUDA 版本在编译后变为 $TORCH_CUDA_VER_AFTER（期望 $CUDA_VER）"
     err "sgl-kernel 编译可能拉入了不兼容的依赖，请重新安装："
     err "  $INSTALL_TORCH_CMD"
@@ -211,9 +218,9 @@ fi
 
 if [ "${BUILD_WHL:-0}" = "1" ]; then
     log "编译 sglang whl 包 (BUILD_WHL=1)"
-    pip install setuptools-scm 2>&1 | tee -a "$LOG_FILE"
+    python3 -c "import setuptools_scm" 2>/dev/null || pip install setuptools-scm 2>&1 | tee -a "$LOG_FILE"
     rm -rf python/dist/sglang-*.whl python/build 2>/dev/null || true
-    cd python && python3 -m build --wheel --no-isolation 2>&1 | tee -a "$LOG_FILE" && cd "$PROJECT_ROOT"
+    (cd python && python3 -m build --wheel --no-isolation 2>&1 | tee -a "$LOG_FILE")
     SGLANG_WHL=$(ls python/dist/sglang-*.whl 2>/dev/null | head -1)
     if [ -z "$SGLANG_WHL" ]; then
         err "sglang whl 包未生成"
@@ -231,7 +238,7 @@ fi
 # ============================================================================
 log "=== 验证 ==="
 
-if python3 -c "from sglang.srt.server_args import ServerArgs; print('SGLang OK')" 2>&1 | tee -a "$LOG_FILE"; then
+if FLASHINFER_DISABLE_VERSION_CHECK=1 python3 -c "from sglang.srt.server_args import ServerArgs; print('SGLang OK')" 2>&1 | tee -a "$LOG_FILE"; then
     :
 else
     err "SGLang 导入失败"
