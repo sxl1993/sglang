@@ -149,7 +149,7 @@ def get_num_indexer_layers(config) -> int:
         return config.num_hidden_layers
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
-        return sum(1 for r in compress_ratios if r == 4)
+        return sum(1 for r in compress_ratios[: config.num_hidden_layers] if r == 4)
     return getattr(config, "num_indexer_layers", 0)
 
 
