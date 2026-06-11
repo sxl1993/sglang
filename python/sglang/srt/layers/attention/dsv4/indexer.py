@@ -68,7 +68,7 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     max_num_pages = page_table.shape[1]
     SCALE_OFFSET = block_size * head_dim
@@ -179,7 +179,7 @@ def fp8_paged_mqa_logits_torch_sm120(
         seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     max_pages = (max_seq_len + block_size - 1) // block_size
     max_padded_seq = max_pages * block_size

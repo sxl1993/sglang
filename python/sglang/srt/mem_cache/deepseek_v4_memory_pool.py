@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import BF16_KV, NOPE_ROPE_BYTES
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
@@ -89,8 +90,20 @@ class DeepSeekV4SingleKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+        # server_args 打印的 kv_cache_dtype 是通用层字段，DSV4 走自己的 KV pool 不读它，
+        # 恒显示 fp8_e4m3。这里按实际 buffer 布局打印 DSV4 真实 KV 精度，避免误导。
+        logger.info(
+            "DSV4 KV pool: actual_dtype=%s, bytes_per_token=%d "
+            "(SGLANG_DSV4_BF16_KV=%s; server_args kv_cache_dtype is generic, ignore it)",
+            "bf16" if BF16_KV else "fp8",
+            self.kv_cache_total_dim,
+            BF16_KV,
+        )
 
     def get_bytes_per_token(self) -> int:
+        if BF16_KV:
+            # precision-dump experiment: nope+rope stored bf16, no scale segment.
+            return (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -103,12 +116,20 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
-
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+        self.bytes_per_page_padded = (
+            ceil_div(bytes_per_page_non_padded, NOPE_ROPE_BYTES) * NOPE_ROPE_BYTES
         )
+
+        if BF16_KV:
+            assert bytes_per_token == (448 + 64) * 2, (
+                "DSV4 BF16 KV layout: (qk_nope_head_dim 448 + qk_rope_head_dim 64) "
+                "* 2 bytes = 1024 bytes/token"
+            )
+        else:
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(

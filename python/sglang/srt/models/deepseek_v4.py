@@ -6,14 +6,9 @@ import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
-    Iterable,
-    List,
     Literal,
-    Optional,
-    Set,
-    Tuple,
-    Union,
 )
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -28,6 +23,12 @@ from sglang.jit_kernel.dsv4 import (
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.models.precision_dump import (
+    append_decode,
+    dump_decode,
+    dump_prefill,
+    dump_tensor,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -156,13 +157,13 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
 
 
 _FREQS_CIS_TO_COS_SIN: dict[
-    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+    tuple[int, torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
 ] = {}
 
 
 def _freqs_cis_to_cos_sin(
     freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
     cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
     same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
@@ -245,10 +246,10 @@ class MQALayer(nn.Module):
         self,
         config: DeepSeekV4Config,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        alt_streams: Optional[List[torch.cuda.Stream]] = None,
-        compress_ratio_override: Optional[int] = None,
+        alt_streams: list[torch.cuda.Stream] | None = None,
+        compress_ratio_override: int | None = None,
     ) -> None:
         super().__init__()
         self.tp_rank = attn_tp_rank = get_attention_tp_rank()
@@ -448,7 +449,7 @@ class MQALayer(nn.Module):
     def _compute_q_a(
         self,
         x: torch.Tensor,
-        qkv_a: Optional[torch.Tensor] = None,
+        qkv_a: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if qkv_a is not None:
             q = qkv_a[..., : self.q_lora_rank]
@@ -460,7 +461,7 @@ class MQALayer(nn.Module):
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
-        q_out: Optional[torch.Tensor] = None,
+        q_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
@@ -487,8 +488,8 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        qkv_a: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+        qkv_a: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         """Compute KV norm + RoPE and write to cache.
 
         When fused_norm_rope_kv=True, uses a single fused kernel that does
@@ -528,7 +529,7 @@ class MQALayer(nn.Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        qkv_a: Optional[torch.Tensor] = None,
+        qkv_a: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
@@ -560,7 +561,7 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        q_out: Optional[torch.Tensor] = None,
+        q_out: torch.Tensor | None = None,
         x_quant=None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
@@ -576,8 +577,8 @@ class MQALayer(nn.Module):
         stream_indexer.wait_stream(current_stream)
 
         x_linear = x_quant if x_quant is not None else x
-        qkv_a: Optional[torch.Tensor] = None
-        qkv_a_ready: Optional[torch.cuda.Event] = None
+        qkv_a: torch.Tensor | None = None
+        qkv_a_ready: torch.cuda.Event | None = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             qkv_a_ready = current_stream.record_event()
@@ -628,7 +629,7 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        q_out: Optional[torch.Tensor] = None,
+        q_out: torch.Tensor | None = None,
         x_quant=None,
     ) -> torch.Tensor:
         """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
@@ -745,9 +746,9 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-        q_out: Optional[torch.Tensor] = None,
+        q_out: torch.Tensor | None = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -757,7 +758,7 @@ class MQALayer(nn.Module):
             qkv_a = None
 
         use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
-        kv: Optional[torch.Tensor]
+        kv: torch.Tensor | None
 
         if self.use_fused_qk_norm_rope:
 
@@ -877,6 +878,11 @@ class MQALayer(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return x
 
+        if dump_prefill(forward_batch):
+            dump_tensor("rollout", self.layer_id, "hidden_in", x, global_pos=positions)
+        elif dump_decode(forward_batch):
+            append_decode("rollout", self.layer_id, "hidden_in", x, global_pos=positions)
+
         attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
@@ -948,6 +954,12 @@ class MQALayer(nn.Module):
             save_kv_cache=False,
         )
         o = o[:, tp_slice, :]
+
+        if dump_prefill(forward_batch):
+            dump_tensor("rollout", self.layer_id, "attn_out", o, global_pos=positions)
+        elif dump_decode(forward_batch):
+            append_decode("rollout", self.layer_id, "attn_out", o, global_pos=positions)
+
         fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
@@ -983,6 +995,11 @@ class MQALayer(nn.Module):
 
         o, _ = self.wo_b(o.flatten(1))
 
+        if dump_prefill(forward_batch):
+            dump_tensor("rollout", self.layer_id, "layer_out", o, global_pos=positions)
+        elif dump_decode(forward_batch):
+            append_decode("rollout", self.layer_id, "layer_out", o, global_pos=positions)
+
         return o
 
 
@@ -991,12 +1008,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         config: DeepSeekV4Config,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        moe_quant_config_override: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
+        moe_quant_config_override: QuantizationConfig | None = None,
         is_nextn: bool = False,
         prefix: str = "",
-        alt_streams: Optional[List[torch.cuda.Stream]] = None,
-        compress_ratio_override: Optional[int] = None,
+        alt_streams: list[torch.cuda.Stream] | None = None,
+        compress_ratio_override: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1060,7 +1077,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
     def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
+        self, token_counts: tuple[int, ...], device: torch.device
     ) -> None:
         paths = (
             (
@@ -1157,7 +1174,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def prewarm_mhc_token_count_buckets(
         self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
 
         token_counts = get_mhc_pre_token_count_representatives(
@@ -1180,7 +1197,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
-        norm: Optional[nn.Module] = None,
+        norm: nn.Module | None = None,
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
@@ -1319,14 +1336,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-        prev_residual: Optional[torch.Tensor] = None,
-        prev_post: Optional[torch.Tensor] = None,
-        prev_comb: Optional[torch.Tensor] = None,
-    ) -> Tuple[
+        prev_residual: torch.Tensor | None = None,
+        prev_post: torch.Tensor | None = None,
+        prev_comb: torch.Tensor | None = None,
+    ) -> tuple[
         torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         use_fused = self.use_fused_mhc_post_pre
 
@@ -1463,7 +1480,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-        _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
+        _a2a_scatter_chunks: list[torch.Tensor] | None = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_attention_tp_size(), get_attention_tp_rank()
             _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
@@ -1514,7 +1531,7 @@ class DeepseekV4Model(nn.Module):
     def __init__(
         self,
         config: DeepSeekV4Config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1607,9 +1624,9 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor],
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+        input_embeds: torch.Tensor | None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+    ) -> torch.Tensor | PPProxyTensors:
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
@@ -1699,7 +1716,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def __init__(
         self,
         config: DeepSeekV4Config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -1785,8 +1802,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
@@ -1874,7 +1891,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str, is_nextn: bool = False, num_hidden_layers: int | None = None
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -1933,9 +1950,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         return name
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2257,10 +2274,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 for skipped_checking_pattern in skipped_checking_patterns
             )
         }
-        if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
+        import os
+        if os.environ.get("SGLANG_SKIP_CHECKPOINT_LOAD_CHECK", "0") == "0":
+            if unloaded_params:
+                logger.warning(
+                    f"Some weights are not initialized from checkpoints: {unloaded_params}"
+                )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
@@ -2309,8 +2328,8 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _dequant_fp8_wo_a(
-    weights: Iterable[Tuple[str, torch.Tensor]],
-) -> Iterable[Tuple[str, torch.Tensor]]:
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
     weights_dict = dict(weights)
 
     for name in list(weights_dict.keys()):

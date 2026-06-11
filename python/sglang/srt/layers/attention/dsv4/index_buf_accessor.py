@@ -1,33 +1,43 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import BF16_KV
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+# precision-dump BF16 KV experiment: when BF16_KV is set, the nope segment is
+# stored bf16 (no fp8, no scale) and each token is 512 contiguous bf16. The
+# pack field names are kept for call-site stability across both modes.
+
 
 @dataclass
 class NopeFp8RopeBf16Pack:
-    k_nope_fp8: torch.Tensor
-    k_rope_bf16: torch.Tensor
-    scale_k_nope_ue8m0: torch.Tensor
+    k_nope_fp8: torch.Tensor  # fp8(448) in fp8 mode, bf16(448) in bf16 mode
+    k_rope_bf16: torch.Tensor  # bf16(64)
+    scale_k_nope_ue8m0: Optional[torch.Tensor] = None  # (N,7) fp8 mode; None bf16
 
     def __post_init__(self):
         assert self.k_nope_fp8.shape[-1] == 448
         assert self.k_rope_bf16.shape[-1] == 64
-        assert self.scale_k_nope_ue8m0.shape[-1] == 7
+        if self.scale_k_nope_ue8m0 is not None:
+            assert self.scale_k_nope_ue8m0.shape[-1] == 7
 
     def slice_pack(self, _slice: Any) -> NopeFp8RopeBf16Pack:
         return NopeFp8RopeBf16Pack(
             k_nope_fp8=self.k_nope_fp8[_slice],
             k_rope_bf16=self.k_rope_bf16[_slice],
-            scale_k_nope_ue8m0=self.scale_k_nope_ue8m0[_slice],
+            scale_k_nope_ue8m0=(
+                None
+                if self.scale_k_nope_ue8m0 is None
+                else self.scale_k_nope_ue8m0[_slice]
+            ),
         )
 
 
@@ -38,14 +48,147 @@ class SetKAndS:
 
     @classmethod
     def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
-        _set_k_and_s_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+        if BF16_KV:
+            _set_k_and_s_torch_bf16(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+        else:
+            _set_k_and_s_torch_fp8(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
     @classmethod
     def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
-        _set_k_and_s_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+        if BF16_KV:
+            _set_k_and_s_triton_bf16(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+        else:
+            _set_k_and_s_triton_fp8(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
 
 
-def _set_k_and_s_triton(
+# ----------------------------------------------------------------------------
+# BF16 path (precision-dump experiment): 512 contiguous bf16 per token.
+# ----------------------------------------------------------------------------
+def _set_k_and_s_triton_bf16(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+
+    k_nope, k_rope = (
+        nope_fp8_rope_bf16_pack.k_nope_fp8,
+        nope_fp8_rope_bf16_pack.k_rope_bf16,
+    )
+
+    num_tokens_to_write_nope, nope_dim = k_nope.shape
+    num_tokens_to_write_rope, rope_dim = k_rope.shape
+
+    assert num_tokens_to_write == num_tokens_to_write_nope == num_tokens_to_write_rope
+    assert buf.dtype == torch.uint8
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
+    assert k_nope.dtype == torch.bfloat16
+    assert k_rope.dtype == torch.bfloat16
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert k_nope.is_contiguous()
+    assert k_rope.is_contiguous()
+
+    buf_bf16 = buf.view(torch.bfloat16)
+    nope_rope_elems = nope_dim + rope_dim  # 512 contiguous bf16 per token
+
+    _set_k_and_s_triton_bf16_kernel[(num_tokens_to_write,)](
+        buf_bf16,
+        loc,
+        k_nope,
+        k_rope,
+        k_nope.stride(0),
+        k_rope.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NUM_NOPE_ELEMS_PER_TOKEN=nope_dim,
+        NOPE_ROPE_ELEMS_PER_TOKEN=nope_rope_elems,
+        BLOCK_NOPE=512,
+        BLOCK_ROPE=64,
+    )
+
+
+@triton.jit
+def _set_k_and_s_triton_bf16_kernel(
+    buf_bf16_ptr,
+    loc_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    k_nope_ptr_stride_0,
+    k_rope_ptr_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_NOPE_ELEMS_PER_TOKEN: tl.constexpr,
+    NOPE_ROPE_ELEMS_PER_TOKEN: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+
+    nope_range = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_range < NUM_NOPE_ELEMS_PER_TOKEN
+    k_nope = tl.load(
+        k_nope_ptr + token_id * k_nope_ptr_stride_0 + nope_range,
+        mask=nope_mask,
+        other=0.0,
+    )
+
+    rope_range = tl.arange(0, BLOCK_ROPE)
+    k_rope = tl.load(k_rope_ptr + token_id * k_rope_ptr_stride_0 + rope_range)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+
+    token_bf16_base = (
+        loc_page_index * (BUF_NUMEL_PER_PAGE // 2)
+        + loc_token_offset_in_page * NOPE_ROPE_ELEMS_PER_TOKEN
+    )
+
+    tl.store(buf_bf16_ptr + token_bf16_base + nope_range, k_nope, mask=nope_mask)
+    tl.store(
+        buf_bf16_ptr + token_bf16_base + NUM_NOPE_ELEMS_PER_TOKEN + rope_range, k_rope
+    )
+
+
+def _set_k_and_s_torch_bf16(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+    page_size: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    k_nope, k_rope = (
+        nope_fp8_rope_bf16_pack.k_nope_fp8,
+        nope_fp8_rope_bf16_pack.k_rope_bf16,
+    )
+    _, nope_dim = k_nope.shape
+    _, rope_dim = k_rope.shape
+
+    assert k_nope.dtype == torch.bfloat16 and k_rope.dtype == torch.bfloat16
+    assert buf.dtype == torch.uint8
+
+    buf_bf16 = buf.view(torch.bfloat16).flatten()
+    loc_page_index = loc // page_size
+    loc_token_offset_in_page = loc % page_size
+    nope_rope_elems = nope_dim + rope_dim
+    token_bf16_base = (
+        loc_page_index * (buf_numel_per_page // 2)
+        + loc_token_offset_in_page * nope_rope_elems
+    )
+    for i in range(num_tokens_to_write):
+        base = token_bf16_base[i]
+        buf_bf16[base : base + nope_dim] = k_nope[i]
+        buf_bf16[base + nope_dim : base + nope_rope_elems] = k_rope[i]
+
+
+# ----------------------------------------------------------------------------
+# FP8 path (production): 448 fp8 nope + 64 bf16 rope + 7 ue8m0 scales.
+# ----------------------------------------------------------------------------
+def _set_k_and_s_triton_fp8(
     buf: torch.Tensor,
     loc: torch.Tensor,
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
@@ -91,7 +234,7 @@ def _set_k_and_s_triton(
     nope_rope_bytes = nope_dim + rope_dim * 2
     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
 
-    _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
+    _set_k_and_s_triton_fp8_kernel[(num_tokens_to_write,)](
         buf_fp8,
         buf_bf16,
         buf_uint8,
@@ -117,7 +260,7 @@ def _set_k_and_s_triton(
 
 
 @triton.jit
-def _set_k_and_s_triton_kernel(
+def _set_k_and_s_triton_fp8_kernel(
     buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
@@ -185,7 +328,7 @@ def _set_k_and_s_triton_kernel(
     tl.store(buf_uint8_ptr + out_s_offsets, k_scale, mask=scale_mask)
 
 
-def _set_k_and_s_torch(
+def _set_k_and_s_torch_fp8(
     buf: torch.Tensor,
     loc: torch.Tensor,
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,

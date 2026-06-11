@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -16,6 +16,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import BF16_KV
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -28,6 +29,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
+from sglang.srt.models.precision_dump import dump_prefill, dump_tensor
 from sglang.srt.utils import add_prefix, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -39,8 +41,8 @@ if TYPE_CHECKING:
 
 class FusedCompressMetadata(NamedTuple):
     write_loc: torch.Tensor
-    extra_data: Optional[torch.Tensor]
-    plan: Union[CompressorDecodePlan, CompressorPrefillPlan]
+    extra_data: torch.Tensor | None
+    plan: CompressorDecodePlan | CompressorPrefillPlan
 
     def copy_(self, other: FusedCompressMetadata) -> None:
         from .metadata import maybe_copy_inplace
@@ -70,6 +72,7 @@ class CompressorBackendMixin:
         forward_batch: ForwardBatch,
         compress_ratio: int,
         is_paged: bool = False,
+        layer_id: int = -1,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 
@@ -133,6 +136,35 @@ class CompressorBackendMixin:
                 )
             return kv_compressed
 
+        # Dump projection output BEFORE the fused compress reduction (boundary 5):
+        # kv_score_input is the wkv/wgate linear output (per-token), kernel input.
+        # Its first coff*head_dim cols are the kv projection (wkv half of the fused
+        # wkv_gate weight). Splits boundary 2's 22% into projection vs the fused
+        # ape+softmax+weighted-sum. Projection is plain torch.mm on both sides, so
+        # this should align ~0 if the divergence is in the reduction kernel.
+        if dump_prefill(forward_batch) and compress_ratio == 4 and not plan.is_decode:
+            coff = 2  # overlap compress (ratio == 4)
+            dump_tensor(
+                "rollout", layer_id, "kv_proj", kv_score_input[:, : coff * head_dim], global_pos=None
+            )
+            # score_proj: score/gate projection (back half of fused wkv_gate output).
+            # kv_proj only validates the kv half; the softmax weights come from this score
+            # half. Splits fuse_out's 22% into "gate projection diverges" vs "kernel
+            # algorithm (ape reshape / overlap mapping / fast-math expf)".
+            dump_tensor(
+                "rollout", layer_id, "score_proj", kv_score_input[:, coff * head_dim :], global_pos=None
+            )
+            # ape_hotfixed: ape as actually fed to the kernel ([2*ratio, head_dim] after
+            # apply_ape_hotfix). Overwrites each prefill step on purpose: if a
+            # colocate weight-sync clobbers ape back to the un-hotfixed layout,
+            # the last dump exposes it.
+            dump_tensor("rollout", layer_id, "ape_hotfixed", ape, global_pos=None)
+            print(
+                f"[APE_DUMP_PT] layer={layer_id} ape.shape={tuple(ape.shape)} "
+                f"ape[:,0]={ape[:, 0].tolist()}",
+                flush=True,
+            )
+
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
@@ -143,6 +175,14 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             extra_data=extra_data,
         )
+
+        # Dump compressor output BEFORE fused norm+rope (boundary 2), to split
+        # the 22% compressor-output divergence into compress-compute vs norm+rope.
+        if dump_prefill(forward_batch) and compress_ratio == 4 and not plan.is_decode:
+            cp = plan.compress_plan.cpu()
+            c_ragged_ids = cp.view(torch.int32)[:, 0].tolist()
+            dump_tensor("rollout", layer_id, "fuse_out", kv_compressed[c_ragged_ids], global_pos=None)
+
         compress_fused_norm_rope_inplace(
             kv_compressed,
             norm.weight,
@@ -166,13 +206,37 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+
+        if dump_prefill(forward_batch):
+            # 只dump compress_plan写入的行（write_plan只写state buffer，不写compress输出）
+            if compressor.ratio == 4:
+                import os
+                if os.environ.get("MILES_DSV4_PRECISION_DUMP") == "1":
+                    # 从metadata提取compress_plan（write_plan不写kv_out）
+                    metadata = self.get_paged_compress_metadata(compressor.ratio)
+                    plan = metadata.plan
+                    if not plan.is_decode:
+                        # 只有compress_plan的ragged_ids写了compress输出
+                        cp = plan.compress_plan.cpu()
+                        c_ragged_ids = cp.view(torch.int32)[:, 0].tolist()
+
+                        # 只dump这些行
+                        valid_kv = new_compressed_kv[c_ragged_ids]
+                        dump_tensor("rollout", layer_id, "kv_compress", valid_kv, global_pos=None)
+                    else:
+                        dump_tensor("rollout", layer_id, "kv_compress", new_compressed_kv, global_pos=None)
+                else:
+                    dump_tensor("rollout", layer_id, "kv_compress", new_compressed_kv, global_pos=None)
+            else:
+                dump_tensor("rollout", layer_id, "kv_compress", new_compressed_kv, global_pos=None)
+
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get() and not BF16_KV:
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=out_loc,
@@ -226,7 +290,7 @@ def is_overlap_compress(compress_ratio: int) -> bool:
 def make_compressor_plan(
     compress_ratio: Literal[4, 128],
     forward_batch: ForwardBatch,
-) -> Union[CompressorDecodePlan, CompressorPrefillPlan]:
+) -> CompressorDecodePlan | CompressorPrefillPlan:
     if forward_batch.forward_mode.is_decode():
         seq_lens_32 = forward_batch.seq_lens.to(torch.int32)
         return CompressorDecodePlan(compress_ratio, seq_lens_32)
@@ -256,11 +320,11 @@ def create_paged_compressor_data(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    extend_lens: Optional[torch.Tensor] = None,
-    seq_lens_cpu: Optional[List[int]] = None,
-    extend_lens_cpu: Optional[List[int]] = None,
+    extend_lens: torch.Tensor | None = None,
+    seq_lens_cpu: list[int] | None = None,
+    extend_lens_cpu: list[int] | None = None,
     use_prefill_cuda_graph: bool = False,
-    num_q_tokens: Optional[int] = None,
+    num_q_tokens: int | None = None,
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
@@ -340,7 +404,7 @@ class Compressor(nn.Module):
         head_dim: int,
         rotate: bool = False,
         prefix: str = "",
-        rotary_emb: Optional[RotaryEmbedding] = None,
+        rotary_emb: RotaryEmbedding | None = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -445,6 +509,7 @@ class Compressor(nn.Module):
             compress_ratio=self.ratio,
             forward_batch=forward_batch,
             is_paged=True,
+            layer_id=self.layer_id,
         )
 
 

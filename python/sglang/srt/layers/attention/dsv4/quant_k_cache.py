@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.dsv4.dequant_k_cache import BF16_KV
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
@@ -77,10 +78,18 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
     assert hidden_dim == 512
     dim_nope = 448
     dim_rope = 64
+    k_bf16 = k_bf16.contiguous()
+
+    if BF16_KV:
+        # precision-dump experiment: no fp8 quant, just split nope/rope as bf16.
+        return NopeFp8RopeBf16Pack(
+            k_nope_fp8=k_bf16[:, :dim_nope].contiguous(),
+            k_rope_bf16=k_bf16[:, dim_nope:].contiguous(),
+            scale_k_nope_ue8m0=None,
+        )
+
     tile_size = 64
     num_tiles = dim_nope // tile_size
-
-    k_bf16 = k_bf16.contiguous()
 
     k_nope_fp8 = torch.empty(
         (num_tokens, dim_nope), dtype=fp8_dtype, device=k_bf16.device

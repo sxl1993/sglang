@@ -745,6 +745,10 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    # precision-dump experiment: store the DSV4 core/swa KV nope segment as
+    # bf16 instead of fp8+ue8m0 scale, making store->load lossless. Layout is
+    # fixed at process start; forces the non-fused store path when set.
+    SGLANG_DSV4_BF16_KV = EnvBool(False)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
@@ -927,7 +931,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:

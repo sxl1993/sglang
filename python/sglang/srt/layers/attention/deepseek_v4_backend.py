@@ -36,6 +36,7 @@ else:
     )
 
 from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+    BF16_KV,
     dequantize_k_cache_paged,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -1008,7 +1009,7 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get() and not BF16_KV:
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1115,7 +1116,8 @@ class DeepseekV4AttnBackend(
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                BF16_KV
+                or q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             ):
                 return self._forward_prefill_sparse(
@@ -1125,6 +1127,19 @@ class DeepseekV4AttnBackend(
                     forward_batch=forward_batch,
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
+                    attn_sink=attn_sink,
+                )
+
+            if BF16_KV:
+                return self._forward_decode_bf16(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    token_to_kv_pool=token_to_kv_pool,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
                     attn_sink=attn_sink,
                 )
 
@@ -1268,6 +1283,99 @@ class DeepseekV4AttnBackend(
             d_v=self.head_dim_v,
             attn_sink=attn_sink,
             topk_length=combined_lens,
+        )
+        return o
+
+    def _forward_decode_bf16(
+        self,
+        *,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: torch.Tensor,
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode under SGLANG_DSV4_BF16_KV: route through the bf16-native
+        flash_mla_sparse_fwd instead of the fp8-only sparse_decode_fwd.
+
+        Gathers the SWA window (always) plus the c4/c128 compressed cache into a
+        flat bf16 workspace via dequantize_k_cache_paged (bit-exact under
+        BF16_KV), rebases the decode page indices into that workspace, then lets
+        flash_mla_sparse_fwd consume them. A slot is valid only when its source
+        index is >= 0 AND its column is within the per-query topk_length: the
+        SWA window can carry stale valid locs past topk_length that the fp8
+        kernel drops via topk_length, so masking on the index sign alone would
+        over-attend. Invalid slots become -1, which the kernel skips
+        position-independently, so the kernel-side topk_length is the full
+        padded width.
+        """
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        # q: (b, 1, h_q, d_qk) -> (b, h_q, d_qk); indices: (b, 1, T) -> (b, T).
+        q_flat = q.squeeze(1)
+        b = q_flat.shape[0]
+
+        def gather_workspace(idx_2d, topk_len, page_size, buf):
+            cols = torch.arange(idx_2d.shape[1], device=idx_2d.device)
+            valid = (idx_2d >= 0) & (cols.view(1, -1) < topk_len.view(-1, 1))
+            gather = (
+                idx_2d.reshape(-1).masked_fill(~valid.reshape(-1), 0).to(torch.int32)
+            )
+            ws = dequantize_k_cache_paged(buf, gather, page_size=page_size)
+            return ws, valid
+
+        def block_indices(valid_2d: torch.Tensor, row_offset: int) -> torch.Tensor:
+            rows, cols = valid_2d.shape
+            idx = torch.arange(
+                rows * cols, device=valid_2d.device, dtype=torch.int32
+            ).view(rows, cols)
+            return (idx + row_offset).masked_fill(~valid_2d, -1)
+
+        swa_ws, swa_valid = gather_workspace(
+            swa_page_indices.squeeze(1),
+            swa_topk_lengths,
+            token_to_kv_pool.swa_window_size,
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+        )
+
+        if compress_ratio == 0:
+            workspace = swa_ws
+            combined = block_indices(swa_valid, row_offset=0)
+        else:
+            extra_ws, extra_valid = gather_workspace(
+                extra_indices.squeeze(1),
+                extra_topk_lengths,
+                token_to_kv_pool.get_extra_key_page_size(layer_id),
+                token_to_kv_pool.get_extra_key_buffer(layer_id),
+            )
+            workspace = torch.cat([extra_ws, swa_ws], dim=0)
+            combined = torch.cat(
+                [
+                    block_indices(extra_valid, row_offset=0),
+                    block_indices(swa_valid, row_offset=extra_ws.shape[0]),
+                ],
+                dim=1,
+            )
+
+        pad = (-combined.shape[1]) % 128
+        if pad:
+            combined = torch.nn.functional.pad(combined, (0, pad), value=-1)
+        topk_length = torch.full(
+            (b,), combined.shape[1], dtype=torch.int32, device=q_flat.device
+        )
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=workspace,
+            indices=combined.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
         )
         return o
 
