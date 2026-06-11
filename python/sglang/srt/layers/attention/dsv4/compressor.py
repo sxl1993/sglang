@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -357,6 +357,7 @@ class Compressor(nn.Module):
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
         )
+        set_weight_attrs(self.ape, {"weight_loader": self.load_ape_weight})
         wkv_gate_dtype = torch.bfloat16
         self.wkv_gate = ReplicatedLinear(
             self.dim,
@@ -374,14 +375,26 @@ class Compressor(nn.Module):
 
         self.ape_converted = False
 
-    def apply_ape_hotfix(self):
-        assert not self.ape_converted
+    def _apply_ape_hotfix(self):
         self.ape_converted = True
 
         if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
+
+    def apply_ape_hotfix(self):
+        assert not self.ape_converted
+        self._apply_ape_hotfix()
+
+    def load_ape_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        # Re-run the hotfix on every load so a colocate weight-sync that clobbers
+        # ape back to the raw layout is re-converted into kernel layout.
+        assert param is self.ape
+        assert loaded_weight.shape == param.shape
+        param.data.copy_(loaded_weight)
+        self.ape_converted = False
+        self._apply_ape_hotfix()
 
     def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
