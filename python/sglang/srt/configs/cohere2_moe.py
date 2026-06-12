@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cohere2Moe text config used by the Cohere Command-A Plus checkpoints."""
 
-from transformers.configuration_utils import PreTrainedConfig
+import dataclasses
+
+from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 try:
@@ -12,8 +14,14 @@ except ImportError:  # older huggingface_hub
         return cls
 
 
-@strict
-class Cohere2MoeConfig(PreTrainedConfig):
+# transformers>=5 makes PretrainedConfig a dataclass; @strict only works there.
+# On transformers<5 the base is a plain class, so skip @strict to keep import working.
+def _maybe_strict(cls):
+    return strict(cls) if dataclasses.is_dataclass(PretrainedConfig) else cls
+
+
+@_maybe_strict
+class Cohere2MoeConfig(PretrainedConfig):
     model_type = "cohere2_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
