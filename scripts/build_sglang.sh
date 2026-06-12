@@ -8,6 +8,7 @@
 #   bash scripts/build_sglang.sh 12.8
 #   bash scripts/build_sglang.sh 12.9
 #   BUILD_WHL=1 CLEAN_BUILD=1 bash scripts/build_sglang.sh 12.9
+#   PYPROJECT_VARIANT=cu129 BUILD_WHL=1 bash scripts/build_sglang.sh 12.9   # 用 cu12.9 依赖变体编译 whl
 #
 # 环境变量:
 #   MAX_JOBS              - 并行编译数 (默认: 24)
@@ -15,6 +16,7 @@
 #   TORCH_CUDA_ARCH_LIST  - 目标 GPU 架构 (默认: 自动检测)
 #   BUILD_WHL             - 设为 1 编译 sglang whl 包并安装（默认 editable 安装）
 #   CLEAN_BUILD           - 设为 1 清理编译缓存
+#   PYPROJECT_VARIANT     - 设为 cu129 时用 python/pyproject.cu129.toml 临时覆盖主 pyproject（build 后自动还原）
 #   SGL_KERNEL_ENABLE_SM100A - SM100A 支持 (默认: OFF)
 #   CCACHE_DIR            - ccache 缓存目录 (默认: ~/.cache/ccache)
 # ============================================================================
@@ -44,6 +46,31 @@ KERNEL_ROOT="$PROJECT_ROOT/sgl-kernel"
 DEPS_DIR="$KERNEL_ROOT/.deps"
 LOG_FILE="/tmp/sglang_build_cu${CUDA_VER_SHORT}.log"
 > "$LOG_FILE"
+
+# PYPROJECT_VARIANT=cu129 时用 python/pyproject.cu129.toml 临时覆盖主 pyproject.toml，
+# build 结束（含失败/中断）由 trap 还原，避免污染工作区
+PYPROJECT_VARIANT="${PYPROJECT_VARIANT:-}"
+PYPROJECT_MAIN="$PROJECT_ROOT/python/pyproject.toml"
+PYPROJECT_BACKUP=""
+restore_pyproject() {
+    if [ -n "$PYPROJECT_BACKUP" ] && [ -f "$PYPROJECT_BACKUP" ]; then
+        mv -f "$PYPROJECT_BACKUP" "$PYPROJECT_MAIN"
+        PYPROJECT_BACKUP=""
+    fi
+}
+swap_pyproject() {
+    [ -z "$PYPROJECT_VARIANT" ] && return 0
+    local variant="$PROJECT_ROOT/python/pyproject.${PYPROJECT_VARIANT}.toml"
+    if [ ! -f "$variant" ]; then
+        err "PYPROJECT_VARIANT=$PYPROJECT_VARIANT 但未找到 $variant"
+        exit 1
+    fi
+    PYPROJECT_BACKUP="${PYPROJECT_MAIN}.bak.$$"
+    cp -f "$PYPROJECT_MAIN" "$PYPROJECT_BACKUP"
+    trap restore_pyproject EXIT INT TERM
+    cp -f "$variant" "$PYPROJECT_MAIN"
+    log "已切换 pyproject 为 $PYPROJECT_VARIANT 变体 (build 结束自动还原)"
+}
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -203,6 +230,8 @@ python3 -c "import sgl_kernel; print(f'sgl-kernel OK: {sgl_kernel.__version__}')
 log "=== 安装 SGLang 主包 ==="
 
 cd "$PROJECT_ROOT"
+
+swap_pyproject
 
 # 编译 sgl-kernel 可能拉入不兼容的 torch，再次校验
 TORCH_CUDA_VER_AFTER=$(python3 -c "import torch; print(torch.version.cuda)" 2>/dev/null || echo "")
