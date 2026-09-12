@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+python/sglang/kernels/aot/.deps/
 **/build/
 **/develop-eggs/
 **/dist/

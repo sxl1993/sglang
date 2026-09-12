@@ -322,6 +322,7 @@ set(INCLUDES
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
+    ${TORCH_INCLUDE_DIRS}
 )
 
 # =========================== Common SM90 Build ============================= #
